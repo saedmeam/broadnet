@@ -41,12 +41,14 @@ import { SoapRequest, SOAP_DEFAULTS } from '../../core/models/soap-transaction.m
 
           <div class="form-row">
             <div class="form-group">
-                <label>Teléfono/Referencia:</label>
-                <input type="text" [(ngModel)]="config.telefono" placeholder="Ej: 0999999999">
+                <label>Teléfono/Referencia (10 dígitos):</label>
+                <input type="text" [(ngModel)]="config.telefono" placeholder="Ej: 0999999999" maxlength="10">
+                <small class="error-text" *ngIf="config.telefono && !isValidPhone()">⚠️ Debe tener 10 dígitos numéricos</small>
             </div>
             <div class="form-group">
                 <label>Monto ($):</label>
-                <input type="number" [(ngModel)]="config.monto" step="0.01">
+                <input type="number" [(ngModel)]="config.monto" step="0.01" min="0.01">
+                <small class="error-text" *ngIf="+config.monto <= 0">⚠️ El monto debe ser mayor a 0</small>
             </div>
           </div>
 
@@ -91,9 +93,14 @@ import { SoapRequest, SOAP_DEFAULTS } from '../../core/models/soap-transaction.m
             </div>
           </details>
 
-          <button class="btn-primary" (click)="invokeSoap()" [disabled]="!config.telefono || !config.monto">
-            ⚡ Enviar Transacción SOAP
-          </button>
+          <div class="actions-grid">
+            <button class="btn-primary" (click)="invokeSoap()" [disabled]="!canSendTransaction() || loading()">
+                ⚡ {{ loading() ? 'Procesando...' : 'Enviar Transacción SOAP' }}
+            </button>
+            <button class="btn-warning" (click)="invokeReversal()" [disabled]="!config.secuencial || loading()">
+                🔄 Enviar Reverso
+            </button>
+          </div>
         </div>
       </div>
 
@@ -130,16 +137,27 @@ import { SoapRequest, SOAP_DEFAULTS } from '../../core/models/soap-transaction.m
     summary { font-weight: 600; color: #34495e; font-size: 0.9rem; }
     .advanced-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.8rem; margin-top: 1rem; }
 
+    .actions-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1.5rem; }
+
     .btn-primary {
-        width: 100%; margin-top: 1.5rem; padding: 0.8rem; background: #3498db; color: white; border: none;
+        padding: 0.8rem; background: #3498db; color: white; border: none;
         border-radius: 6px; font-weight: 600; cursor: pointer; transition: background 0.2s;
     }
-    .btn-primary:hover { background: #2980b9; }
-    .btn-primary:disabled { background: #bdc3c7; cursor: not-allowed; }
+    .btn-primary:hover:not(:disabled) { background: #2980b9; }
+
+    .btn-warning {
+        padding: 0.8rem; background: #f39c12; color: white; border: none;
+        border-radius: 6px; font-weight: 600; cursor: pointer; transition: background 0.2s;
+    }
+    .btn-warning:hover:not(:disabled) { background: #e67e22; }
+
+    .btn-primary:disabled, .btn-warning:disabled { background: #bdc3c7; cursor: not-allowed; }
 
     .result-card { margin-top: 2rem; background: #2d3436; color: #dfe6e9; border: none; }
     .result-card h3 { color: #00cec9; border-color: #636e72; }
     pre { white-space: pre-wrap; word-break: break-all; font-family: 'Consolas', monospace; font-size: 0.85rem; background: #1e272e; padding: 1rem; border-radius: 6px; }
+
+    .error-text { color: #e74c3c; font-size: 0.75rem; margin-top: 0.2rem; display: block; }
 
     @media (max-width: 900px) { .grid-container { grid-template-columns: 1fr; } }
   `]
@@ -181,14 +199,27 @@ export class TestSoapComponent implements OnInit {
 
     onProductChange() {
         if (this.selectedProduct) {
-            // Autocompletar monto si el producto tiene un precio definido
-            // Algunos productos de recarga tienen precio fijo en el nombre o campo precio
             this.config.monto = this.selectedProduct.preciovta.toString();
             console.log('Producto seleccionado:', this.selectedProduct);
         }
     }
 
+    isValidPhone(): boolean {
+        return /^\d{10}$/.test(this.config.telefono);
+    }
+
+    canSendTransaction(): boolean {
+        return this.isValidPhone() && +this.config.monto > 0;
+    }
+
+    private extractXmlContent(xml: string, tagName: string): string {
+        const match = xml.match(new RegExp(`<${tagName}>(.*?)<\/${tagName}>`));
+        return match ? match[1] : '';
+    }
+
     invokeSoap() {
+        if (!this.canSendTransaction()) return;
+
         this.loading.set(true);
         this.soapResult.set(null);
 
@@ -199,14 +230,37 @@ export class TestSoapComponent implements OnInit {
 
         this.soap.sendTransaction(this.config).subscribe({
             next: (res) => {
-                this.soapResult.set(res);
+                const errorMsg = this.extractXmlContent(res, 'Mensaje');
+                const codError = this.extractXmlContent(res, 'TransaccionResult');
+
+                let summary = `✅ Respuesta Procesada:\n`;
+                summary += `Código: ${codError || 'N/A'}\n`;
+                summary += `Mensaje: ${errorMsg || 'Sin mensaje de Broadnet'}\n\n`;
+                summary += `XML Original:\n` + res;
+
+                this.soapResult.set(summary);
                 this.loading.set(false);
-                // Incrementar secuencial para la próxima prueba
-                const nextSeq = parseInt(this.config.secuencial) + 1;
-                this.config.secuencial = nextSeq.toString();
             },
             error: (err) => {
-                this.soapResult.set('❌ Error en la comunicación:\n' + JSON.stringify(err, null, 2));
+                this.soapResult.set('❌ Error de conexión o timeout después de 2 reintentos.\nDetalles: ' + (err.statusText || 'Error de Red'));
+                this.loading.set(false);
+            }
+        });
+    }
+
+    invokeReversal() {
+        this.loading.set(true);
+        this.soapResult.set(null);
+
+        this.soap.sendReversal(this.config).subscribe({
+            next: (res) => {
+                this.soapResult.set('🔄 Reverso enviado:\n' + res);
+                this.loading.set(false);
+                // Después de un reverso, generamos nuevo secuencial
+                this.config.secuencial = Math.floor(Math.random() * 1000000).toString();
+            },
+            error: (err) => {
+                this.soapResult.set('❌ Error en Reverso:\n' + JSON.stringify(err, null, 2));
                 this.loading.set(false);
             }
         });
